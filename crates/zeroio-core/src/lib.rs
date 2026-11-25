@@ -11,9 +11,12 @@
 //! - [`edgecc`]: Adaptive [`EdgeCc`] congestion controller.
 //! - [`model`], [`inference`], [`envelope`], [`aggregate`], [`path_table`]: path estimation,
 //!   shared-bottleneck inference, safety envelope, and path-prior sharing.
-//! - [`packet`]: zero-copy L2/VLAN/IPv4/IPv6/TCP/UDP header parser.
+//! - [`packet`]: zero-copy L2/VLAN/IPv4/IPv6/TCP/UDP header parser, RFC 1071 checksums,
+//!   TCP option codecs, and zero-allocation frame encoders.
 //! - [`inspect`]: zero-copy TLS `ClientHello` SNI extraction and QUIC header/DCID inspection.
-//! - [`tcp`], [`udp`]: O(1) generation-checked connection slab and session primitives.
+//! - [`tcp`]: O(1) generation-checked connection slab, stateless SYN cookies, bounded
+//!   RX/TX reassembly and SACK scoreboards, and full sans-I/O [`TcpStack`].
+//! - [`udp`]: O(1) bounded UDP session flow table ([`UdpTable`]).
 //! - [`sched`], [`codel`]: DRR pacing scheduler, [`TimingWheel`], and CoDel AQM.
 //! - [`sim`]: deterministic multi-flow event-driven network simulator.
 
@@ -46,10 +49,17 @@ pub use inference::{Inference, SbdStats, SharedBottleneckJudge};
 pub use inspect::{QuicHeader, TlsSniResult, extract_tls_sni, inspect_quic_header};
 pub use instant::TransportInstant;
 pub use model::PathModel;
-pub use packet::PacketView;
+pub use packet::{
+    FrameEncodeError, PacketView, SackBlock, TcpFrameSpec, TcpHeaderView, TcpOptions, UdpFrameSpec,
+    encode_tcp_frame, encode_tcp_frame_parts, encode_udp_frame, internet_checksum,
+    l4_pseudo_checksum,
+};
 pub use path_table::{PathKey, PathSample, PathTable};
 pub use rate_sample::{RateSample, RateSampler, TxRecord};
 pub use rtt::RttState;
 pub use sched::{Admit, Lease, Scheduler, TimingWheel};
-pub use tcp::{ConnHandle, ConnSlab, TcpState};
-pub use udp::UdpFlowKey;
+pub use tcp::{
+    CcKind, ConnHandle, ConnSlab, SeqNum, SynCookieKey, TcpConfig, TcpConn, TcpConnSnapshot,
+    TcpError, TcpFourTuple, TcpStack, TcpState,
+};
+pub use udp::{UdpFlowKey, UdpSession, UdpTable};

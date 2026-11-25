@@ -1,5 +1,16 @@
 //! Server-grade O(1) TCP connection table primitives (generation-checked slab
-//! handles and state tracking) for the sans-I/O TCP stack.
+//! handles and state tracking) and the sans-I/O TCP protocol engine.
+
+pub mod buffer;
+pub mod conn;
+pub mod cookie;
+pub mod seq;
+pub mod stack;
+
+pub use conn::{CcKind, TcpConfig, TcpConn, TcpConnSnapshot, TcpFourTuple};
+pub use cookie::{COOKIE_MSS_TABLE, SynCookieKey, generate_syn_cookie, verify_syn_cookie};
+pub use seq::SeqNum;
+pub use stack::{TcpError, TcpStack};
 
 /// Generation-checked connection handle preventing stale timers or packets from
 /// touching a recycled slot.
@@ -60,26 +71,32 @@ impl<T> ConnSlab<T> {
         }
     }
 
-    /// Allocate a slot in amortized O(1) time.
-    pub fn insert(&mut self, value: T) -> ConnHandle {
-        self.active += 1;
+    /// Try to allocate a slot in amortized O(1) time without panicking on `u32` overflow.
+    pub fn try_insert(&mut self, value: T) -> Option<ConnHandle> {
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             slot.value = Some(value);
-            return ConnHandle {
+            self.active += 1;
+            return Some(ConnHandle {
                 index,
                 generation: slot.generation,
-            };
+            });
         }
-        let index = u32::try_from(self.slots.len()).expect("ConnSlab capacity overflow");
+        let index = u32::try_from(self.slots.len()).ok()?;
         self.slots.push(Slot {
             generation: 1,
             value: Some(value),
         });
-        ConnHandle {
+        self.active += 1;
+        Some(ConnHandle {
             index,
             generation: 1,
-        }
+        })
+    }
+
+    /// Allocate a slot in amortized O(1) time.
+    pub fn insert(&mut self, value: T) -> ConnHandle {
+        self.try_insert(value).expect("ConnSlab capacity overflow")
     }
 
     /// Look up a live slot in O(1) time, rejecting stale generations.
