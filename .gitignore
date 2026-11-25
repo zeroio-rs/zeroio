@@ -1,4 +1,6 @@
 /target
+crates/zeroio-xdp-ebpf/target/
+crates/zeroio-xdp-ebpf/Cargo.lock
 Cargo.lock
 **/*.rs.bk
 *.o

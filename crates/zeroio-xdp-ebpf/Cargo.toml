@@ -8,7 +8,6 @@ description = "XDP eBPF dataplane program for Zeroio (ACL, per-IP rate limiting,
 
 [dependencies]
 aya-ebpf = "0.2.1"
-network-types = "0.2.0"
 zeroio-xdp-common = { path = "../zeroio-xdp-common", default-features = false }
 
 [[bin]]
