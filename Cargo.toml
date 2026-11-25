@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/zeroio",
+    "crates/zeroio-core",
+    "crates/zeroio-xdp-common",
+    "crates/zeroio-dataplane",
+]
+# The eBPF kernel crate targets bpfel-unknown-none with its own pinned nightly toolchain.
+exclude = ["crates/zeroio-xdp-ebpf"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "0BSD"
+repository = "https://github.com/zeroio-rs/zeroio"
+homepage = "https://github.com/zeroio-rs/zeroio"
+authors = ["Zypixh <moying8259@gmail.com>"]
+rust-version = "1.100.0"
+
+[workspace.lints.rust]
+warnings = "deny"

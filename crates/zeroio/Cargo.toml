@@ -1,0 +1,22 @@
+[package]
+name = "zeroio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Open-source, memory-safe Rust network dataplane unifying XDP/AF_XDP, congestion control, zero-copy packet inspection, and userspace TCP/UDP."
+
+[dependencies]
+zeroio-core = { version = "0.1.0", path = "../zeroio-core" }
+zeroio-dataplane = { version = "0.1.0", path = "../zeroio-dataplane" }
+zeroio-xdp-common = { version = "0.1.0", path = "../zeroio-xdp-common" }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "zeroio-xdp-ebpf"
+version = "0.1.0"
+edition = "2024"
+license = "0BSD"
+publish = false
+description = "XDP eBPF dataplane program for Zeroio (ACL, per-IP rate limiting, L4 forwarding, AF_XDP redirect)."
+
+[dependencies]
+aya-ebpf = "0.2.1"
+network-types = "0.2.0"
+zeroio-xdp-common = { path = "../zeroio-xdp-common", default-features = false }
+
+[[bin]]
+name = "zeroio-xdp-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = "fat"
