@@ -8,11 +8,15 @@ use zeroio_core::rate_sample::RateSample;
 use zeroio_core::rtt::RttState;
 use zeroio_core::sim::{SimConfig, TraceKind, run};
 
+type LossLog = Rc<RefCell<Vec<(u64, u64, u64, bool, u64)>>>;
+type SnapLog = Rc<RefCell<Vec<(u64, u64, u64, u64, u64, u64)>>>;
+type ProbeRates = Rc<RefCell<Vec<(u64, u64, u64, u64)>>>;
+
 struct Tap {
     inner: EdgeCc,
     rates: Rc<RefCell<Vec<(u64, u64, u64)>>>, // (t_us, rate_bps, delivered)
-    loss_log: Rc<RefCell<Vec<(u64, u64, u64, bool, u64)>>>, // (t, lost, inflight, persist, proven)
-    snap: Rc<RefCell<Vec<(u64, u64, u64, u64, u64, u64)>>>, // (t, cwnd, pacing, slope, p_rand, inflight)
+    loss_log: LossLog,                        // (t, lost, inflight, persist, proven)
+    snap: SnapLog,                            // (t, cwnd, pacing, slope, p_rand, inflight)
 }
 
 impl CongestionController for Tap {
@@ -53,7 +57,7 @@ impl CongestionController for Tap {
             .model
             .bw_slope()
             .zip(self.inner.model.base_rtt())
-            .map(|(s, b)| s as u128 * b.as_micros().max(1) as u128 / 1_000_000);
+            .map(|(s, b)| s as u128 * b.as_micros().max(1) / 1_000_000);
         if self.loss_log.borrow().len() < 60 {
             self.loss_log.borrow_mut().push((
                 now.micros(),
@@ -105,7 +109,7 @@ fn run_bbr3_probe() {
     use zeroio_core::rtt::RttState;
     struct T {
         inner: Bbr3Ref,
-        rates: Rc<RefCell<Vec<(u64, u64, u64, u64)>>>,
+        rates: ProbeRates,
     }
     impl CongestionController for T {
         fn on_sent(&mut self, n: TransportInstant, b: u64, f: u64, a: bool) {
