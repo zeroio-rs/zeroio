@@ -1,5 +1,6 @@
 //! Thread-per-core dataplane abstractions and XDP/kernel transport policy.
 
+pub use zeroio_core::{PacketView, TransportInstant};
 pub use zeroio_xdp_common::{XDP_DEFAULT_FRAME_SIZE, XdpCounters, XdpInterfaceMode};
 
 /// Requested XDP program attach mode.

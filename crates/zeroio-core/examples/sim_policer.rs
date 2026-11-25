@@ -5,7 +5,7 @@ use zeroio_core::edgecc::{EdgeCc, Tier};
 use zeroio_core::sim::{Policer, SimConfig, run};
 
 fn cell(delay_ms: u64, policer_mbps: u64, burst_bytes: u64, link_mbps: u64) {
-    let mut cfg = SimConfig {
+    let cfg = SimConfig {
         delay: Duration::from_millis(delay_ms / 2),
         ack_delay_prop: Duration::from_millis(delay_ms / 2),
         rate_bps: link_mbps * 125_000,

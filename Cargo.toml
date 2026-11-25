@@ -14,7 +14,6 @@ version = "0.1.0"
 edition = "2024"
 license = "0BSD"
 repository = "https://github.com/zeroio-rs/zeroio"
-homepage = "https://github.com/zeroio-rs/zeroio"
 authors = ["Zypixh <moying8259@gmail.com>"]
 rust-version = "1.100.0"
 
