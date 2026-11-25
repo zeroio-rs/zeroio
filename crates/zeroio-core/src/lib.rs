@@ -50,8 +50,8 @@ pub use inspect::{QuicHeader, TlsSniResult, extract_tls_sni, inspect_quic_header
 pub use instant::TransportInstant;
 pub use model::PathModel;
 pub use packet::{
-    FrameEncodeError, PacketView, SackBlock, TcpFrameSpec, TcpHeaderView, TcpOptions, UdpFrameSpec,
-    encode_tcp_frame, encode_tcp_frame_parts, encode_udp_frame, internet_checksum,
+    AccEcnOption, FrameEncodeError, PacketView, SackBlock, TcpFrameSpec, TcpHeaderView, TcpOptions,
+    UdpFrameSpec, encode_tcp_frame, encode_tcp_frame_parts, encode_udp_frame, internet_checksum,
     l4_pseudo_checksum,
 };
 pub use path_table::{PathKey, PathSample, PathTable};

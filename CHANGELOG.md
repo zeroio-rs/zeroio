@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `zeroio-core`: complete sans-I/O TCP stack (`TcpStack`, `TcpConn`, `TcpConfig`, `SeqNum`, `RxBuffer`, `TxQueue`, `SynCookieKey`), bounded UDP session table (`UdpTable`, `UdpSession`), RFC 1071 IPv4/TCP/UDP checksums, TCP option codecs (`MSS`, `WindowScale`, `SACK`, `Timestamps`), zero-allocation Ethernet/VLAN/IPv4/IPv6 frame encoders (`encode_tcp_frame`, `encode_udp_frame`), and end-to-end virtual-wire integration tests (`tests/tcp_stack.rs`).
+- `zeroio-core`: complete sans-I/O TCP stack (`TcpStack`, `TcpConn`, `TcpConfig`, `SeqNum`, `RxBuffer`, `TxQueue`, `SynCookieKey`) with Tail Loss Probe (RFC 8985 TLP), Zero-Window Probe (ZWP), and zero-copy `peek_rx`/`consume_rx` stream API; bounded UDP session table (`UdpTable`, `UdpSession`); RFC 1071 IPv4/TCP/UDP checksums; TCP option codecs (`MSS`, `WindowScale`, `SACK`, `Timestamps`, RFC 9768 `AccECN` Order 0/1 Kind 172/174); zero-allocation Ethernet/VLAN/IPv4/IPv6 frame encoders (`encode_tcp_frame`, `encode_udp_frame`); zero-dependency microbenchmarks (`benches/core_bench.rs`); and end-to-end virtual-wire integration tests (`tests/tcp_stack.rs`).
 
 ## [0.1.0] - 2026-11-26
 

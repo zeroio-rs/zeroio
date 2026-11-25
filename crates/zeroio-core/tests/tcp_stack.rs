@@ -173,10 +173,12 @@ impl VirtualNetwork {
             let next_ev = [next_wire, next_c, next_s].into_iter().flatten().min();
 
             let Some(ev) = next_ev else {
+                self.now = max_time;
                 break;
             };
             let target = ev.max(self.now);
             if target > max_time {
+                self.now = max_time;
                 break;
             }
             self.now = target;
@@ -270,6 +272,13 @@ fn handshake_bulk_transfer_graceful_close_and_path_table_warm_start() {
             break;
         }
     }
+    assert_eq!(
+        received.len(),
+        data.len(),
+        "got {} vs {}",
+        received.len(),
+        data.len()
+    );
     assert_eq!(received, data);
 
     // Echo 4 KiB server -> client.
@@ -657,4 +666,107 @@ fn adversarial_mutated_frames_capacity_bounds_and_abort_rst() {
     assert!(rst_seen);
     assert!(server.snapshot(h1).is_none());
     assert!(server.connect(s_addr, c3, c_mac, t0).is_ok());
+}
+
+#[test]
+fn tlp_recovers_tail_loss_faster_than_rto() {
+    let c_mac = [0x02, 0, 0, 0, 0, 0x71];
+    let s_mac = [0x02, 0, 0, 0, 0, 0x72];
+    let c_addr: SocketAddr = "10.50.0.1:43000".parse().unwrap();
+    let s_addr: SocketAddr = "10.50.0.2:443".parse().unwrap();
+
+    let client = TcpStack::new(
+        TcpConfig {
+            src_mac: c_mac,
+            ..TcpConfig::default()
+        },
+        SynCookieKey::from_seed(*b"tlp-client-00001"),
+    );
+    let mut server = TcpStack::new(
+        TcpConfig {
+            src_mac: s_mac,
+            ..TcpConfig::default()
+        },
+        SynCookieKey::from_seed(*b"tlp-server-00002"),
+    );
+    server.listen(443).unwrap();
+
+    // C2S #1=SYN, #2=3rd ACK, #3=first data segment -> drop ONLY #3 (tail loss).
+    let mut policy = WirePolicy::clean(Duration::from_millis(5));
+    policy.drop_c2s_indices = vec![3];
+
+    let mut net = VirtualNetwork::new(client, server, policy);
+    let ch = net.client.connect(c_addr, s_addr, s_mac, net.now).unwrap();
+    net.step_until(net.now + Duration::from_millis(25));
+    let sh = net.server.accept().unwrap();
+
+    let msg = b"tail-loss-probe-payload";
+    assert_eq!(net.client.send(ch, msg).unwrap(), msg.len());
+
+    // Step only 120ms (< 200ms RTO_MIN!). TLP must fire around ~60ms and recover.
+    net.step_until(net.now + Duration::from_millis(120));
+    let mut out = [0u8; 64];
+    let n = net.server.recv(sh, &mut out).unwrap();
+    assert_eq!(&out[..n], msg);
+    assert_eq!(net.client.snapshot(ch).unwrap().retransmits, 1);
+}
+
+#[test]
+fn zero_window_probe_and_zero_copy_peek_consume_recover_stall() {
+    let c_mac = [0x02, 0, 0, 0, 0, 0x81];
+    let s_mac = [0x02, 0, 0, 0, 0, 0x82];
+    let c_addr: SocketAddr = "10.60.0.1:44000".parse().unwrap();
+    let s_addr: SocketAddr = "10.60.0.2:443".parse().unwrap();
+
+    let client = TcpStack::new(
+        TcpConfig {
+            src_mac: c_mac,
+            ..TcpConfig::default()
+        },
+        SynCookieKey::from_seed(*b"zwp-client-00001"),
+    );
+    let mut server = TcpStack::new(
+        TcpConfig {
+            src_mac: s_mac,
+            rx_buf_size: 1024,
+            ..TcpConfig::default()
+        },
+        SynCookieKey::from_seed(*b"zwp-server-00002"),
+    );
+    server.listen(443).unwrap();
+
+    let mut net = VirtualNetwork::new(client, server, WirePolicy::clean(Duration::from_millis(5)));
+    let ch = net.client.connect(c_addr, s_addr, s_mac, net.now).unwrap();
+    net.step_until(net.now + Duration::from_millis(25));
+    let sh = net.server.accept().unwrap();
+
+    // Queue 2560 bytes (> server's 1024-byte RX window) -> server advertises rwnd=0.
+    let data = make_payload(2560);
+    assert_eq!(net.client.send(ch, &data).unwrap(), data.len());
+    net.step_until(net.now + Duration::from_millis(50));
+
+    // Drain first 1024 bytes using zero-copy peek_rx + consume_rx.
+    let mut received = Vec::with_capacity(data.len());
+    let (p1, p2) = net.server.peek_rx(sh).unwrap();
+    let first_take = p1.len() + p2.len();
+    assert_eq!(first_take, 1024);
+    received.extend_from_slice(p1);
+    received.extend_from_slice(p2);
+    assert_eq!(net.server.consume_rx(sh, first_take).unwrap(), first_take);
+
+    // Advance past ZWP persist timer so client probes and drains remaining 1536 bytes.
+    for _ in 0..8 {
+        net.step_until(net.now + Duration::from_millis(260));
+        let (s1, s2) = net.server.peek_rx(sh).unwrap();
+        let avail = s1.len() + s2.len();
+        if avail > 0 {
+            received.extend_from_slice(s1);
+            received.extend_from_slice(s2);
+            net.server.consume_rx(sh, avail).unwrap();
+        }
+        if received.len() == data.len() {
+            break;
+        }
+    }
+    assert_eq!(received, data);
 }

@@ -15,3 +15,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "core_bench"
+harness = false

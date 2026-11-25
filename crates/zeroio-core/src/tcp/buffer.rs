@@ -86,21 +86,48 @@ impl RxBuffer {
         self.fin_delivered
     }
 
+    /// Borrow up to two contiguous slices of unread in-order data without copying.
+    pub fn peek_slices(&self) -> (&[u8], &[u8]) {
+        if self.len == 0 {
+            return (&[], &[]);
+        }
+        let cap = self.ring.len();
+        let first = (cap - self.read_pos).min(self.len);
+        let p1 = &self.ring[self.read_pos..self.read_pos + first];
+        let p2 = if self.len > first {
+            &self.ring[..self.len - first]
+        } else {
+            &[]
+        };
+        (p1, p2)
+    }
+
+    /// Advance the read cursor by up to `n` bytes after zero-copy inspection.
+    pub fn consume(&mut self, n: usize) -> usize {
+        let take = n.min(self.len);
+        if take == 0 {
+            return 0;
+        }
+        let cap = self.ring.len();
+        self.read_pos = (self.read_pos + take) % cap;
+        self.len -= take;
+        take
+    }
+
     /// Read up to `dst.len()` contiguous in-order bytes from the buffer.
     pub fn read_into(&mut self, dst: &mut [u8]) -> usize {
         let to_read = dst.len().min(self.len);
         if to_read == 0 {
             return 0;
         }
-        let cap = self.ring.len();
-        let first = (cap - self.read_pos).min(to_read);
-        dst[..first].copy_from_slice(&self.ring[self.read_pos..self.read_pos + first]);
+        let (p1, p2) = self.peek_slices();
+        let first = p1.len().min(to_read);
+        dst[..first].copy_from_slice(&p1[..first]);
         if to_read > first {
-            dst[first..to_read].copy_from_slice(&self.ring[..to_read - first]);
+            let rem = to_read - first;
+            dst[first..to_read].copy_from_slice(&p2[..rem]);
         }
-        self.read_pos = (self.read_pos + to_read) % cap;
-        self.len -= to_read;
-        to_read
+        self.consume(to_read)
     }
 
     /// Accept a segment starting at `seq` with `data` and optional `has_fin`.
@@ -509,6 +536,15 @@ impl TxQueue {
             sacked: false,
             lost: false,
         });
+    }
+
+    /// Return the newest un-sacked segment for a Tail Loss Probe (RFC 8985).
+    pub fn last_unacked_segment(&self) -> Option<(SeqNum, usize)> {
+        self.segs
+            .iter()
+            .rev()
+            .find(|s| !s.sacked && !s.lost)
+            .map(|s| (s.seq, s.len as usize))
     }
 
     /// Return the earliest un-sacked segment marked `lost` for fast/RTO retransmission.

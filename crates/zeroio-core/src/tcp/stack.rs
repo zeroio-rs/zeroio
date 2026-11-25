@@ -237,6 +237,25 @@ impl TcpStack {
         Ok(n)
     }
 
+    /// Borrow unread contiguous receive slices without copying.
+    pub fn peek_rx(&self, handle: ConnHandle) -> Result<(&[u8], &[u8]), TcpError> {
+        let conn = self.slab.get(handle).ok_or(TcpError::UnknownConnection)?;
+        Ok(conn.peek_rx())
+    }
+
+    /// Consume `n` bytes previously inspected via [`TcpStack::peek_rx`].
+    pub fn consume_rx(&mut self, handle: ConnHandle, n: usize) -> Result<usize, TcpError> {
+        let conn = self
+            .slab
+            .get_mut(handle)
+            .ok_or(TcpError::UnknownConnection)?;
+        let taken = conn.consume_rx(n);
+        if taken > 0 {
+            self.schedule_conn(handle);
+        }
+        Ok(taken)
+    }
+
     /// Initiate graceful connection close (`FIN`).
     pub fn close(&mut self, handle: ConnHandle) -> Result<(), TcpError> {
         let conn = self

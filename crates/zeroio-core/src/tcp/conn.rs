@@ -8,8 +8,8 @@ use crate::cc::reference::{Bbr3Ref, CubicRef, NewRenoRef};
 use crate::cc::{CcSnapshot, CongestionController};
 use crate::edgecc::{EdgeCc, PathPrior, Tier};
 use crate::packet::{
-    PacketView, TCP_FLAG_ACK, TCP_FLAG_CWR, TCP_FLAG_ECE, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST,
-    TCP_FLAG_SYN, TcpFrameSpec, TcpHeaderView, TcpOptions, encode_tcp_frame_parts,
+    AccEcnOption, PacketView, TCP_FLAG_ACK, TCP_FLAG_CWR, TCP_FLAG_ECE, TCP_FLAG_FIN, TCP_FLAG_PSH,
+    TCP_FLAG_RST, TCP_FLAG_SYN, TcpFrameSpec, TcpHeaderView, TcpOptions, encode_tcp_frame_parts,
 };
 use crate::path_table::PathSample;
 use crate::rate_sample::RateSampler;
@@ -111,6 +111,7 @@ pub struct TcpConnSnapshot {
     pub in_flight: u64,
     pub rx_available: usize,
     pub tx_queued: usize,
+    pub fin_received: bool,
 }
 
 fn build_controller(
@@ -198,6 +199,12 @@ pub struct TcpConn {
     delayed_ack_delay: Duration,
     rto_deadline: Option<TransportInstant>,
     rto_backoff: u32,
+    pto_deadline: Option<TransportInstant>,
+    tlp_sent: bool,
+    need_tlp_probe: bool,
+    zwp_deadline: Option<TransportInstant>,
+    zwp_backoff: u32,
+    need_zwp: bool,
     syn_retries: u32,
     time_wait_at: Option<TransportInstant>,
     time_wait_duration: Duration,
@@ -268,6 +275,12 @@ impl TcpConn {
             delayed_ack_delay: cfg.delayed_ack_delay,
             rto_deadline: Some(now + SYN_RTO),
             rto_backoff: 0,
+            pto_deadline: None,
+            tlp_sent: false,
+            need_tlp_probe: false,
+            zwp_deadline: None,
+            zwp_backoff: 0,
+            need_zwp: false,
             syn_retries: 0,
             time_wait_at: None,
             time_wait_duration: cfg.time_wait_duration,
@@ -357,6 +370,12 @@ impl TcpConn {
             delayed_ack_delay: cfg.delayed_ack_delay,
             rto_deadline: Some(now + SYN_RTO),
             rto_backoff: 0,
+            pto_deadline: None,
+            tlp_sent: false,
+            need_tlp_probe: false,
+            zwp_deadline: None,
+            zwp_backoff: 0,
+            need_zwp: false,
             syn_retries: 0,
             time_wait_at: None,
             time_wait_duration: cfg.time_wait_duration,
@@ -433,6 +452,12 @@ impl TcpConn {
             delayed_ack_delay: cfg.delayed_ack_delay,
             rto_deadline: None,
             rto_backoff: 0,
+            pto_deadline: None,
+            tlp_sent: false,
+            need_tlp_probe: false,
+            zwp_deadline: None,
+            zwp_backoff: 0,
+            need_zwp: false,
             syn_retries: 0,
             time_wait_at: None,
             time_wait_duration: cfg.time_wait_duration,
@@ -482,6 +507,16 @@ impl TcpConn {
         self.rx.read_into(dst)
     }
 
+    /// Borrow up to two contiguous slices of unread inbound payload without copying.
+    pub fn peek_rx(&self) -> (&[u8], &[u8]) {
+        self.rx.peek_slices()
+    }
+
+    /// Advance the receive cursor after inspecting bytes returned by [`TcpConn::peek_rx`].
+    pub fn consume_rx(&mut self, n: usize) -> usize {
+        self.rx.consume(n)
+    }
+
     pub fn close(&mut self) {
         if matches!(
             self.state,
@@ -516,6 +551,7 @@ impl TcpConn {
             in_flight: self.tx.in_flight_bytes(),
             rx_available: self.rx.available(),
             tx_queued: self.tx.queued_bytes(),
+            fin_received: self.rx.fin_contiguous(),
         }
     }
 
@@ -555,7 +591,13 @@ impl TcpConn {
                 earliest = Some(earliest.map_or(d, |e| e.min(d)));
             }
         };
-        if self.need_syn || self.need_syn_ack || self.need_rst || self.ack_now {
+        if self.need_syn
+            || self.need_syn_ack
+            || self.need_rst
+            || self.ack_now
+            || self.need_tlp_probe
+            || self.need_zwp
+        {
             return Some(TransportInstant::ZERO);
         }
         if self.tx.has_lost() {
@@ -568,9 +610,43 @@ impl TcpConn {
             return Some(TransportInstant::ZERO);
         }
         consider(self.delayed_ack_at);
+        consider(self.pto_deadline);
+        consider(self.zwp_deadline);
         consider(self.rto_deadline);
         consider(self.time_wait_at);
         earliest
+    }
+
+    fn arm_pto(&mut self, now: TransportInstant) {
+        if self.tlp_sent || !self.tx.has_unacked() || self.rto_backoff > 0 {
+            return;
+        }
+        let srtt = self.rtt.srtt.unwrap_or(Duration::from_millis(40));
+        let single_flight = self.tx.in_flight_bytes() <= u64::from(self.effective_mss);
+        let extra = if single_flight {
+            self.delayed_ack_delay
+        } else {
+            Duration::ZERO
+        };
+        let pto = (srtt * 2).max(Duration::from_millis(10)) + extra;
+        self.pto_deadline = Some(now + pto);
+    }
+
+    fn arm_zwp_if_stalled(&mut self, now: TransportInstant) {
+        if self.peer_rwnd == 0
+            && self.tx.unsent_bytes() > 0
+            && matches!(self.state, TcpState::Established | TcpState::CloseWait)
+            && self.zwp_deadline.is_none()
+        {
+            let base = self
+                .rtt
+                .srtt
+                .map(|s| s * 2)
+                .unwrap_or(Duration::from_millis(200))
+                .max(Duration::from_millis(200));
+            let delay = (base * (1u32 << self.zwp_backoff.min(5))).min(Duration::from_secs(60));
+            self.zwp_deadline = Some(now + delay);
+        }
     }
 
     fn can_send_new_data_window(&self) -> bool {
@@ -594,6 +670,16 @@ impl TcpConn {
         }
         if include_sack && self.sack_enabled {
             self.rx.write_sack_options(&mut opts);
+        }
+        if self.acc_ecn.mode == EcnMode::AccEcn && self.acc_ecn.handshake_done() {
+            let (e0b, e1b, ceb) = self.acc_ecn.byte_counters();
+            if e0b > 0 || e1b > 0 || ceb > 0 {
+                opts.acc_ecn = Some(AccEcnOption {
+                    e0b: Some(e0b),
+                    ceb: Some(ceb),
+                    e1b: Some(e1b),
+                });
+            }
         }
         opts
     }
@@ -786,6 +872,11 @@ impl TcpConn {
         // Update peer advertised receive window.
         if (th.flags & TCP_FLAG_ACK) != 0 {
             self.peer_rwnd = u64::from(th.window) << self.snd_wscale;
+            if self.peer_rwnd > 0 {
+                self.zwp_deadline = None;
+                self.zwp_backoff = 0;
+                self.need_zwp = false;
+            }
         }
 
         // Process ACK / SACK / ECN feedback.
@@ -820,9 +911,16 @@ impl TcpConn {
             if self.acc_ecn.handshake_done() {
                 match self.acc_ecn.mode {
                     EcnMode::AccEcn => {
-                        let ce_pkts = self.acc_ecn.on_ack_ace(th.ace_bits());
-                        if ce_pkts > 0 {
-                            ce_bytes = ce_pkts.saturating_mul(u64::from(self.effective_mss));
+                        let ace_pkts = self.acc_ecn.on_ack_ace(th.ace_bits());
+                        let opt_ce = opts
+                            .acc_ecn
+                            .map(|o| self.acc_ecn.on_ack_option(o.e0b, o.e1b, o.ceb))
+                            .unwrap_or(0);
+                        if opt_ce > 0 {
+                            ce_bytes = opt_ce;
+                            self.cwr_pending = true;
+                        } else if ace_pkts > 0 {
+                            ce_bytes = ace_pkts.saturating_mul(u64::from(self.effective_mss));
                             self.cwr_pending = true;
                         }
                     }
@@ -877,18 +975,25 @@ impl TcpConn {
 
             if outcome.ack_advanced {
                 self.rto_backoff = 0;
+                self.tlp_sent = false;
+                self.need_tlp_probe = false;
                 self.last_retx_seq = None;
                 self.last_retx_tsecr = None;
             }
-            // Re-arm or clear RTO deadline based on remaining un-acked data.
+            // Re-arm or clear RTO & PTO deadlines based on remaining un-acked data.
             if self.tx.has_unacked() || (self.fin_sent && !self.fin_acked) {
                 if outcome.ack_advanced {
                     let rto = self.rtt.rto() * (1u32 << self.rto_backoff.min(6));
                     self.rto_deadline = Some(now + rto);
+                    self.arm_pto(now);
                 }
             } else {
                 self.rto_deadline = None;
+                self.pto_deadline = None;
+                self.tlp_sent = false;
+                self.need_tlp_probe = false;
             }
+            self.arm_zwp_if_stalled(now);
         }
 
         // Process inbound payload + FIN.
@@ -935,7 +1040,7 @@ impl TcpConn {
         }
     }
 
-    /// Handle active timers (SYN/Data RTO, delayed ACK, TIME_WAIT expiry).
+    /// Handle active timers (SYN/Data RTO, TLP PTO, ZWP persist, delayed ACK, TIME_WAIT expiry).
     pub fn on_timer(&mut self, now: TransportInstant) {
         if let Some(tw) = self.time_wait_at
             && now >= tw
@@ -943,6 +1048,8 @@ impl TcpConn {
             self.state = TcpState::Closed;
             self.time_wait_at = None;
             self.rto_deadline = None;
+            self.pto_deadline = None;
+            self.zwp_deadline = None;
             return;
         }
 
@@ -951,6 +1058,36 @@ impl TcpConn {
         {
             self.ack_now = true;
             self.delayed_ack_at = None;
+        }
+
+        if let Some(pto_at) = self.pto_deadline
+            && now >= pto_at
+        {
+            self.pto_deadline = None;
+            if self.tx.has_unacked()
+                && !self.tlp_sent
+                && matches!(
+                    self.state,
+                    TcpState::Established | TcpState::FinWait1 | TcpState::CloseWait
+                )
+            {
+                self.tlp_sent = true;
+                self.need_tlp_probe = true;
+            }
+        }
+
+        if let Some(zwp_at) = self.zwp_deadline
+            && now >= zwp_at
+        {
+            self.zwp_deadline = None;
+            if self.peer_rwnd == 0
+                && self.tx.unsent_bytes() > 0
+                && matches!(self.state, TcpState::Established | TcpState::CloseWait)
+            {
+                self.need_zwp = true;
+                self.zwp_backoff = self.zwp_backoff.saturating_add(1);
+                self.arm_zwp_if_stalled(now);
+            }
         }
 
         if let Some(rto_at) = self.rto_deadline
@@ -1196,6 +1333,128 @@ impl TcpConn {
             }
         }
 
+        // 4b) Tail Loss Probe (RFC 8985 §7): send 1 probe without shrinking cwnd.
+        if self.need_tlp_probe {
+            self.need_tlp_probe = false;
+            if (self.tx.unsent_bytes() == 0 || !self.can_send_new_data_window())
+                && let Some((seq, seg_len)) = self.tx.last_unacked_segment()
+                && let Some((p1, p2)) = self.tx.slice_for(seq, seg_len)
+            {
+                let mut flags = TCP_FLAG_ACK | TCP_FLAG_PSH;
+                let ae = self.apply_ack_ecn_flags(&mut flags);
+                let opts = self.base_options(now, true);
+                let spec = TcpFrameSpec {
+                    src_mac: self.src_mac,
+                    dst_mac: self.peer_mac,
+                    vlan_id: self.vlan_id,
+                    src_ip: self.flow.local.ip(),
+                    dst_ip: self.flow.peer.ip(),
+                    ip_ecn: self.ecn_ip_codepoint(true),
+                    ttl: self.ttl,
+                    src_port: self.flow.local.port(),
+                    dst_port: self.flow.peer.port(),
+                    seq: seq.raw(),
+                    ack: self.rx.rcv_nxt().raw(),
+                    flags,
+                    ae,
+                    window: self.scaled_rx_window(),
+                    options: opts,
+                    payload: &[],
+                };
+                if let Ok(frame_len) = encode_tcp_frame_parts(tx_buf, &spec, p1, p2) {
+                    if !emit(&tx_buf[..frame_len]) {
+                        return;
+                    }
+                    self.on_ack_emitted();
+                    let marker = self.sampler.delivered_marker();
+                    let app_lim = self.sampler.app_limited_now();
+                    self.tx.mark_retransmitted(seq, now, marker, app_lim);
+                    self.retransmits = self.retransmits.saturating_add(1);
+                    self.last_retx_seq = Some(seq);
+                    self.last_retx_tsecr = Some(ts_val_from(now));
+                    self.next_pacing_at =
+                        Some(now + pacing_gap_for(frame_len, self.cc.pacing_rate()));
+                }
+            }
+        }
+
+        // 4c) Zero-Window Probe (RFC 9293 §3.8.6.1): keep peer window updates moving.
+        if self.need_zwp {
+            self.need_zwp = false;
+            if self.peer_rwnd == 0
+                && self.tx.unsent_bytes() > 0
+                && matches!(self.state, TcpState::Established | TcpState::CloseWait)
+            {
+                if self.tx.in_flight_bytes() == 0 {
+                    let seq = self.tx.snd_nxt();
+                    if let Some((p1, p2)) = self.tx.slice_for(seq, 1) {
+                        let mut flags = TCP_FLAG_ACK;
+                        let ae = self.apply_ack_ecn_flags(&mut flags);
+                        let opts = self.base_options(now, true);
+                        let spec = TcpFrameSpec {
+                            src_mac: self.src_mac,
+                            dst_mac: self.peer_mac,
+                            vlan_id: self.vlan_id,
+                            src_ip: self.flow.local.ip(),
+                            dst_ip: self.flow.peer.ip(),
+                            ip_ecn: self.ecn_ip_codepoint(true),
+                            ttl: self.ttl,
+                            src_port: self.flow.local.port(),
+                            dst_port: self.flow.peer.port(),
+                            seq: seq.raw(),
+                            ack: self.rx.rcv_nxt().raw(),
+                            flags,
+                            ae,
+                            window: self.scaled_rx_window(),
+                            options: opts,
+                            payload: &[],
+                        };
+                        if let Ok(frame_len) = encode_tcp_frame_parts(tx_buf, &spec, p1, p2) {
+                            if !emit(&tx_buf[..frame_len]) {
+                                return;
+                            }
+                            self.on_ack_emitted();
+                            let rel_seq = self.tx.rel_nxt();
+                            let rec = self.sampler.note_sent(rel_seq, 1, now, false, None);
+                            self.tx.mark_new_sent(1, rec);
+                            self.bytes_tx = self.bytes_tx.saturating_add(1);
+                            if self.rto_deadline.is_none() {
+                                self.rto_deadline = Some(now + self.rtt.rto());
+                            }
+                        }
+                    }
+                } else {
+                    let mut flags = TCP_FLAG_ACK;
+                    let ae = self.apply_ack_ecn_flags(&mut flags);
+                    let opts = self.base_options(now, true);
+                    let spec = TcpFrameSpec {
+                        src_mac: self.src_mac,
+                        dst_mac: self.peer_mac,
+                        vlan_id: self.vlan_id,
+                        src_ip: self.flow.local.ip(),
+                        dst_ip: self.flow.peer.ip(),
+                        ip_ecn: 0,
+                        ttl: self.ttl,
+                        src_port: self.flow.local.port(),
+                        dst_port: self.flow.peer.port(),
+                        seq: self.tx.snd_una().sub(1).raw(),
+                        ack: self.rx.rcv_nxt().raw(),
+                        flags,
+                        ae,
+                        window: self.scaled_rx_window(),
+                        options: opts,
+                        payload: &[],
+                    };
+                    if let Ok(frame_len) = encode_tcp_frame_parts(tx_buf, &spec, &[], &[]) {
+                        if !emit(&tx_buf[..frame_len]) {
+                            return;
+                        }
+                        self.on_ack_emitted();
+                    }
+                }
+            }
+        }
+
         // 5) New payload data segments bounded by min(cwnd, peer_rwnd) and pacing.
         for _ in 0..16 {
             let unsent = self.tx.unsent_bytes();
@@ -1270,7 +1529,9 @@ impl TcpConn {
             if self.rto_deadline.is_none() {
                 self.rto_deadline = Some(now + self.rtt.rto());
             }
+            self.arm_pto(now);
         }
+        self.arm_zwp_if_stalled(now);
 
         // 6) Graceful FIN when send queue is completely drained.
         if self.close_requested && self.tx.queued_bytes() == 0 && !self.fin_sent {

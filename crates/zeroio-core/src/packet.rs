@@ -30,6 +30,29 @@ pub const MAX_TCP_OPTIONS_LEN: usize = 40;
 /// Maximum SACK blocks that fit in a standard 40-byte TCP options header.
 pub const MAX_SACK_BLOCKS: usize = 4;
 
+/// RFC 9768 AccECN option kinds (Order 0: EE0B/CEB/EE1B, Order 1: EE1B/CEB/EE0B).
+pub const TCP_OPT_ACCECN_ORDER0: u8 = 172;
+pub const TCP_OPT_ACCECN_ORDER1: u8 = 174;
+
+/// Decoded RFC 9768 AccECN 24-bit byte-counter option fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccEcnOption {
+    pub e0b: Option<u64>,
+    pub ceb: Option<u64>,
+    pub e1b: Option<u64>,
+}
+
+fn read_u24_be(b: &[u8]) -> u64 {
+    (u64::from(b[0]) << 16) | (u64::from(b[1]) << 8) | u64::from(b[2])
+}
+
+fn write_u24_be(out: &mut [u8], val: u64) {
+    let v = (val & 0x00FF_FFFF) as u32;
+    out[0] = ((v >> 16) & 0xFF) as u8;
+    out[1] = ((v >> 8) & 0xFF) as u8;
+    out[2] = (v & 0xFF) as u8;
+}
+
 /// A single RFC 2018 TCP SACK block (`[left, right)` in wrapping 32-bit sequence space).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SackBlock {
@@ -46,6 +69,7 @@ pub struct TcpOptions {
     pub timestamps: Option<(u32, u32)>,
     pub sack_blocks: [SackBlock; MAX_SACK_BLOCKS],
     pub sack_len: u8,
+    pub acc_ecn: Option<AccEcnOption>,
 }
 
 impl TcpOptions {
@@ -132,6 +156,29 @@ impl TcpOptions {
                             let tsecr = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
                             opts.timestamps = Some((tsval, tsecr));
                         }
+                        // RFC 9768 AccECN option (Order 0 = 172, Order 1 = 174; len = 2, 5, 8, or 11)
+                        TCP_OPT_ACCECN_ORDER0 | TCP_OPT_ACCECN_ORDER1 => {
+                            if !matches!(len, 2 | 5 | 8 | 11) {
+                                return None;
+                            }
+                            let f0 = (len >= 5).then(|| read_u24_be(&data[0..3]));
+                            let f1 = (len >= 8).then(|| read_u24_be(&data[3..6]));
+                            let f2 = (len == 11).then(|| read_u24_be(&data[6..9]));
+                            let parsed = if kind == TCP_OPT_ACCECN_ORDER0 {
+                                AccEcnOption {
+                                    e0b: f0,
+                                    ceb: f1,
+                                    e1b: f2,
+                                }
+                            } else {
+                                AccEcnOption {
+                                    e1b: f0,
+                                    ceb: f1,
+                                    e0b: f2,
+                                }
+                            };
+                            opts.acc_ecn = Some(parsed);
+                        }
                         // Unknown option: skip safely.
                         _ => {}
                     }
@@ -214,6 +261,33 @@ impl TcpOptions {
                     out[pos..pos + 4].copy_from_slice(&block.left.to_be_bytes());
                     out[pos + 4..pos + 8].copy_from_slice(&block.right.to_be_bytes());
                     pos += 8;
+                }
+            }
+        }
+        if let Some(ae_opt) = self.acc_ecn {
+            // Count non-omitted fields from the front (Order 0: e0b, ceb, e1b).
+            let field_count = match (ae_opt.e0b, ae_opt.ceb, ae_opt.e1b) {
+                (_, _, Some(_)) => 3usize,
+                (_, Some(_), None) => 2usize,
+                (Some(_), None, None) => 1usize,
+                (None, None, None) => 0usize,
+            };
+            let opt_len = 2 + field_count * 3;
+            if pos + opt_len <= out.len() && pos + opt_len <= MAX_TCP_OPTIONS_LEN {
+                out[pos] = TCP_OPT_ACCECN_ORDER0;
+                out[pos + 1] = opt_len as u8;
+                pos += 2;
+                if field_count >= 1 {
+                    write_u24_be(&mut out[pos..pos + 3], ae_opt.e0b.unwrap_or(0));
+                    pos += 3;
+                }
+                if field_count >= 2 {
+                    write_u24_be(&mut out[pos..pos + 3], ae_opt.ceb.unwrap_or(0));
+                    pos += 3;
+                }
+                if field_count == 3 {
+                    write_u24_be(&mut out[pos..pos + 3], ae_opt.e1b.unwrap_or(0));
+                    pos += 3;
                 }
             }
         }
@@ -1000,5 +1074,37 @@ mod tests {
         assert_eq!(TcpOptions::parse(&[2, 0, 0, 0]), None);
         assert_eq!(TcpOptions::parse(&[8, 10, 1, 2]), None);
         assert_eq!(TcpOptions::parse(&[5, 6, 0, 0, 0, 0]), None);
+        assert_eq!(TcpOptions::parse(&[TCP_OPT_ACCECN_ORDER0, 3, 0]), None);
+    }
+
+    #[test]
+    fn accecn_option_order0_order1_and_omission_roundtrip() {
+        let mut raw = [0u8; 40];
+        let opts = TcpOptions {
+            timestamps: Some((10, 20)),
+            acc_ecn: Some(AccEcnOption {
+                e0b: Some(0x12_3456),
+                ceb: Some(0x00_0789),
+                e1b: Some(0xAB_CDEF),
+            }),
+            ..TcpOptions::default()
+        };
+        let len = opts.encode(&mut raw).unwrap();
+        assert_eq!(len, 24); // 10 (TS) + 11 (AccECN) = 21 -> padded to 24
+        let decoded = TcpOptions::parse(&raw[..len]).unwrap();
+        assert_eq!(decoded.timestamps, Some((10, 20)));
+        assert_eq!(decoded.acc_ecn, opts.acc_ecn);
+
+        // Order 1 (Kind 174): e1b, ceb only (8 bytes, trailing e0b omitted).
+        let order1 = [TCP_OPT_ACCECN_ORDER1, 8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let parsed1 = TcpOptions::parse(&order1).unwrap();
+        assert_eq!(
+            parsed1.acc_ecn,
+            Some(AccEcnOption {
+                e1b: Some(0x01_0203),
+                ceb: Some(0x04_0506),
+                e0b: None,
+            })
+        );
     }
 }
