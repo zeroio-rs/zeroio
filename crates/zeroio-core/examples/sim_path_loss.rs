@@ -17,7 +17,7 @@ fn cell(delay_ms: u64, uniform_loss: f64, rate_mbps: u64) {
         seed: 0x9e37_79b9_7f4a_7c15,
         ..SimConfig::default()
     };
-    cfg.buffer_bytes = cfg.rate_bps * (delay_ms as u64) * 1000 / 1_000_000;
+    cfg.buffer_bytes = cfg.rate_bps * delay_ms * 1000 / 1_000_000;
     for (label, mut cc) in [
         (
             "edgecc",
