@@ -60,7 +60,7 @@ pub type FlowId = u64;
 /// Each flow's deadline lands in the slot of the finest level that
 /// can represent it; coarser levels hold far-future deadlines which
 /// cascade down as time advances. Cancellation and generation are
-/// handled by the [`Queued`] generation tag — stale entries are
+/// handled by the `Queued` generation tag — stale entries are
 /// skipped on pop, never double-fired.
 #[derive(Debug)]
 pub struct TimingWheel {

@@ -784,7 +784,7 @@ impl PathModel {
         self.bw_dev.get().map(|d| (d * 1.2533) as u64)
     }
 
-    /// Confidence in `bw_est` ∈ [0,1]: saturates with sample count and
+    /// Confidence in `bw_est` ∈ `[0, 1]`: saturates with sample count and
     /// decays once the estimate goes stale (>8 RTT since last sample).
     pub fn bw_confidence(&self, now: TransportInstant) -> f64 {
         if self.bw_samples == 0 {
@@ -902,7 +902,7 @@ impl PathModel {
         self.bdp_est().map(|b| in_flight > b).unwrap_or(false)
     }
 
-    /// `p_rand` — random-loss baseline ∈ [0,1]: loss rate on samples
+    /// `p_rand` — random-loss baseline ∈ `[0, 1]`: loss rate on samples
     /// with no qdelay rise, no CE, outside acceleration windows (new;
     /// high-loss international paths need this to avoid treating
     /// random loss as congestion).
@@ -914,13 +914,13 @@ impl PathModel {
         Some((self.quiet_lost as f64 / d).clamp(0.0, 1.0))
     }
 
-    /// Spurious-retransmit ratio (DSACK/Eifel) ∈ [0,1].
+    /// Spurious-retransmit ratio (DSACK/Eifel) ∈ `[0, 1]`.
     pub fn spurious_ratio(&self) -> Option<f64> {
         (self.retx_bytes > 0)
             .then(|| (self.spurious_bytes as f64 / self.retx_bytes as f64).min(1.0))
     }
 
-    /// `alpha` — CE fraction EWMA ∈ [0,1] (DCTCP RFC 8257).
+    /// `alpha` — CE fraction EWMA ∈ `[0, 1]` (DCTCP RFC 8257).
     pub fn alpha(&self) -> Option<f64> {
         self.alpha.get()
     }
@@ -931,7 +931,7 @@ impl PathModel {
         self.lt_bw
     }
 
-    /// `delay_signal_quality` ∈ [0,1] (new): 1.0 when low-inflight RTT
+    /// `delay_signal_quality` ∈ `[0, 1]` (new): 1.0 when low-inflight RTT
     /// deviation is tiny vs base_rtt, →0 as jitter swamps the signal.
     /// `None` until enough low-inflight samples exist.
     pub fn delay_signal_quality(&self) -> Option<f64> {

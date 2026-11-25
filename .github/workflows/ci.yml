@@ -8,8 +8,29 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTDOCFLAGS: -D warnings
 
 jobs:
+  repo-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check repository cleanliness and allowed Markdown files
+        run: |
+          set -euo pipefail
+          bad_md=$(find . -name '*.md' \
+            -not -path './.git/*' \
+            -not -path './README.md' \
+            -not -path './AGENTS.md' \
+            -not -path './ARCHITECTURE.md' \
+            -not -path './CHANGELOG.md' \
+            -not -path './.github/pull_request_template.md')
+          if [ -n "$bad_md" ]; then
+            echo "Disallowed markdown files detected (keep process notes out of the repo):"
+            echo "$bad_md"
+            exit 1
+          fi
+
   check-and-test:
     runs-on: ubuntu-latest
     steps:
@@ -20,5 +41,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo check --workspace --all-targets
+      - run: cargo check -p zeroio-xdp-common --no-default-features
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo doc --workspace --no-deps

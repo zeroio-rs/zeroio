@@ -8,7 +8,7 @@
 //! Layout:
 //! - [`parts`]: reusable mechanisms (PRR, HyStart++) shared by the
 //!   reference controllers and the EdgeCC decision layer (T5).
-//! - [`reference`]: validation-mode controllers (**not production
+//! - [`mod@reference`]: validation-mode controllers (**not production
 //!   algorithms**) — NewRenoRef/CubicRef today, Bbr3Ref/LossBlindRef in
 //!   T5 via parameter-pinning of the same code.
 

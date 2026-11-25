@@ -13,6 +13,5 @@ description = "Pure safe Rust sans-I/O core for Zeroio: congestion control (Edge
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lints.rust]
-unsafe_code = "forbid"
-warnings = "deny"
+[lints]
+workspace = true

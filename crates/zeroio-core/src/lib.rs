@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! zeroio-core — pure, `#![forbid(unsafe_code)]`, sans-I/O networking and
 //! transport algorithms for the Zeroio dataplane.
 //!

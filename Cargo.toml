@@ -19,3 +19,14 @@ rust-version = "1.100.0"
 
 [workspace.lints.rust]
 warnings = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"

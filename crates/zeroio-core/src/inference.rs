@@ -101,7 +101,7 @@ impl SbdStats {
 /// (RFC 8382 summary statistics; merge/split policy — including
 /// D-A2's "宁可误拆不可误并" hysteresis — is implemented in T6.)
 pub trait SharedBottleneckJudge {
-    /// Correlation estimate ∈ [0,1] between two flows' signals.
+    /// Correlation estimate ∈ `[0, 1]` between two flows' signals.
     fn correlation(&self, a: &SbdStats, b: &SbdStats) -> Option<f64>;
 }
 

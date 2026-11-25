@@ -229,11 +229,11 @@ pub struct PathPrior {
     pub bw_bps: u64,
     /// Prior base RTT.
     pub base_rtt: Duration,
-    /// Prior random-loss baseline ∈ [0,1].
+    /// Prior random-loss baseline ∈ `[0, 1]`.
     pub p_rand: f64,
     /// Prior ECN alpha if the path marks.
     pub alpha: f64,
-    /// Confidence ∈ [0,1] — scales how much the prior seeds startup.
+    /// Confidence ∈ `[0, 1]` — scales how much the prior seeds startup.
     pub confidence: f64,
 }
 

@@ -61,11 +61,11 @@ pub struct PathSample {
     pub bw_bps: u64,
     /// Observed base RTT.
     pub base_rtt: Duration,
-    /// Random-loss baseline ∈ [0,1].
+    /// Random-loss baseline ∈ `[0, 1]`.
     pub p_rand: f64,
-    /// CE alpha ∈ [0,1] if the path marked.
+    /// CE alpha ∈ `[0, 1]` if the path marked.
     pub alpha: f64,
-    /// Reorder degree ∈ [0,1] (reordered/(delivered) estimate).
+    /// Reorder degree ∈ `[0, 1]` (reordered/(delivered) estimate).
     pub reorder: f64,
     /// Handshake RTT (connect_rtt).
     pub connect_rtt: Option<Duration>,
@@ -88,7 +88,7 @@ pub struct PathEntry {
     pub reorder: f64,
     /// EWMA handshake RTT (µs).
     pub connect_rtt_us: f64,
-    /// EWMA failure rate ∈ [0,1].
+    /// EWMA failure rate ∈ `[0, 1]`.
     pub fail_rate: f64,
     /// Sample count (confidence input).
     pub samples: u32,
@@ -101,7 +101,7 @@ pub struct PathEntry {
 }
 
 impl PathEntry {
-    /// Age-decayed confidence ∈ [0,1]: saturates with samples, halves
+    /// Age-decayed confidence ∈ `[0, 1]`: saturates with samples, halves
     /// every CONFIDENCE_HALF_LIFE of staleness.
     pub fn confidence(&self, now: TransportInstant) -> f64 {
         let n = (self.samples as f64 / 8.0).min(1.0);
