@@ -414,6 +414,12 @@ pub struct TxQueue {
     /// Monotonic sent payload cursor since handshake completion.
     rel_nxt: u64,
     segs: VecDeque<TxSeg>,
+    /// Running total of bytes neither SACKed nor marked lost (`!sacked && !lost`).
+    in_flight_bytes: u64,
+    /// Running count of un-SACKed segments currently marked lost (`lost && !sacked`).
+    lost_count: usize,
+    /// Running count of segments currently marked `sacked`.
+    sacked_count: usize,
     dup_acks: u32,
     /// Reusable scratch vector to keep ACK processing allocation-free after warmup.
     ack_scratch: Vec<TxRecord>,
@@ -431,6 +437,9 @@ impl TxQueue {
             cum_acked_bytes: 0,
             rel_nxt: 0,
             segs: VecDeque::with_capacity(64),
+            in_flight_bytes: 0,
+            lost_count: 0,
+            sacked_count: 0,
             dup_acks: 0,
             ack_scratch: Vec::with_capacity(32),
         }
@@ -465,22 +474,18 @@ impl TxQueue {
         self.len.saturating_sub(sent)
     }
 
+    #[inline]
     pub fn in_flight_bytes(&self) -> u64 {
-        let mut inflight = 0u64;
-        for seg in &self.segs {
-            if !seg.sacked && !seg.lost {
-                inflight += u64::from(seg.len);
-            }
-        }
-        inflight
+        self.in_flight_bytes
     }
 
     pub fn has_unacked(&self) -> bool {
         !self.segs.is_empty()
     }
 
+    #[inline]
     pub fn has_lost(&self) -> bool {
-        self.segs.iter().any(|s| s.lost && !s.sacked)
+        self.lost_count > 0
     }
 
     /// Enqueue outbound application bytes; returns number of bytes accepted.
@@ -524,6 +529,7 @@ impl TxQueue {
         let rel_seq = self.rel_nxt;
         self.snd_nxt = self.snd_nxt.add(len as u32);
         self.rel_nxt = self.rel_nxt.saturating_add(len as u64);
+        self.in_flight_bytes += len as u64;
         self.segs.push_back(TxSeg {
             seq,
             rel_seq,
@@ -549,6 +555,9 @@ impl TxQueue {
 
     /// Return the earliest un-sacked segment marked `lost` for fast/RTO retransmission.
     pub fn next_retransmit(&self) -> Option<(SeqNum, usize)> {
+        if self.lost_count == 0 {
+            return None;
+        }
         self.segs
             .iter()
             .find(|s| s.lost && !s.sacked)
@@ -563,12 +572,21 @@ impl TxQueue {
         delivered_marker: u64,
         app_limited: bool,
     ) {
-        if let Some(seg) = self.segs.iter_mut().find(|s| s.seq == seq) {
+        let idx = self.segs.partition_point(|s| s.seq.lt(seq));
+        if let Some(seg) = self.segs.get_mut(idx)
+            && seg.seq == seq
+        {
             seg.sent_at = now;
             seg.delivered_at_send = delivered_marker;
             seg.is_app_limited = app_limited;
             seg.retransmitted = true;
-            seg.lost = false;
+            if seg.lost {
+                seg.lost = false;
+                if !seg.sacked {
+                    self.lost_count -= 1;
+                    self.in_flight_bytes += u64::from(seg.len);
+                }
+            }
         }
     }
 
@@ -578,7 +596,10 @@ impl TxQueue {
         for seg in &mut self.segs {
             if !seg.sacked && !seg.lost {
                 seg.lost = true;
-                lost_bytes += u64::from(seg.len);
+                let seg_bytes = u64::from(seg.len);
+                lost_bytes += seg_bytes;
+                self.lost_count += 1;
+                self.in_flight_bytes -= seg_bytes;
             }
         }
         self.dup_acks = 0;
@@ -638,7 +659,14 @@ impl TxQueue {
                 let seg_end = front.seq.add(front.len);
                 if seg_end.le(ack) {
                     let seg = self.segs.pop_front().unwrap();
-                    if !seg.sacked {
+                    if seg.sacked {
+                        self.sacked_count -= 1;
+                    } else {
+                        if seg.lost {
+                            self.lost_count -= 1;
+                        } else {
+                            self.in_flight_bytes -= u64::from(seg.len);
+                        }
                         self.ack_scratch.push(TxRecord {
                             seq: seg.rel_seq,
                             end_seq: seg.rel_seq + u64::from(seg.len),
@@ -659,6 +687,9 @@ impl TxQueue {
             {
                 let cut = ack.offset_from(front.seq);
                 if !front.sacked {
+                    if !front.lost {
+                        self.in_flight_bytes -= u64::from(cut);
+                    }
                     self.ack_scratch.push(TxRecord {
                         seq: front.rel_seq,
                         end_seq: front.rel_seq + u64::from(cut),
@@ -676,6 +707,7 @@ impl TxQueue {
         }
 
         // Apply SACK blocks (including DSACK detection if block falls below SND.UNA).
+        let mut applied_sack = false;
         let mut highest_sacked: Option<SeqNum> = None;
         for blk in sack_blocks {
             let b_left = SeqNum(blk.left);
@@ -691,11 +723,22 @@ impl TxQueue {
             if b_right.gt(self.snd_nxt) {
                 continue;
             }
-            for seg in &mut self.segs {
+            let mut idx = self.segs.partition_point(|s| s.seq.add(s.len).le(b_left));
+            while idx < self.segs.len() {
+                let seg = &mut self.segs[idx];
+                if !seg.seq.lt(b_right) {
+                    break;
+                }
                 let seg_end = seg.seq.add(seg.len);
                 if !seg.sacked && seg.seq.ge(b_left) && seg_end.le(b_right) {
                     seg.sacked = true;
-                    seg.lost = false;
+                    self.sacked_count += 1;
+                    if seg.lost {
+                        seg.lost = false;
+                        self.lost_count -= 1;
+                    } else {
+                        self.in_flight_bytes -= u64::from(seg.len);
+                    }
                     self.ack_scratch.push(TxRecord {
                         seq: seg.rel_seq,
                         end_seq: seg.rel_seq + u64::from(seg.len),
@@ -705,7 +748,9 @@ impl TxQueue {
                         is_app_limited: seg.is_app_limited,
                         is_retransmit: seg.retransmitted,
                     });
+                    applied_sack = true;
                 }
+                idx += 1;
             }
             highest_sacked = Some(match highest_sacked {
                 Some(h) if h.gt(b_right) => h,
@@ -713,14 +758,17 @@ impl TxQueue {
             });
         }
 
-        // Track highest sacked across all scoreboard entries too.
-        for seg in &self.segs {
-            if seg.sacked {
-                let seg_end = seg.seq.add(seg.len);
-                highest_sacked = Some(match highest_sacked {
-                    Some(h) if h.gt(seg_end) => h,
-                    _ => seg_end,
-                });
+        // Only scan the scoreboard when prior SACKed entries remain in flight.
+        if self.sacked_count > 0 {
+            for seg in self.segs.iter().rev() {
+                if seg.sacked {
+                    let seg_end = seg.seq.add(seg.len);
+                    highest_sacked = Some(match highest_sacked {
+                        Some(h) if h.gt(seg_end) => h,
+                        _ => seg_end,
+                    });
+                    break;
+                }
             }
         }
 
@@ -729,32 +777,36 @@ impl TxQueue {
             self.dup_acks = self.dup_acks.saturating_add(1);
         }
 
-        // Loss detection:
-        // 1) >=3 segments SACKed past an un-sacked segment, or >=3 pure dupacks for the head.
-        // 2) RACK-style time threshold: un-sacked segment sent before `latest_sacked_tx - srtt/4`.
+        // Loss detection fast path: on pure cumulative-ACK streams with zero SACKed entries,
+        // neither SACK-hole nor RACK thresholds can trigger, so skip the reverse board scan.
         let mut newly_lost_bytes = 0u64;
-        let rack_thresh = srtt.map(|r| r / 4).unwrap_or(Duration::from_millis(5));
-        let newest_acked_tx = self.ack_scratch.iter().map(|r| r.sent_at).max();
+        if self.sacked_count > 0 {
+            let rack_thresh = srtt.map(|r| r / 4).unwrap_or(Duration::from_millis(5));
+            let newest_acked_tx = self.ack_scratch.iter().map(|r| r.sent_at).max();
 
-        let mut sacked_after = 0u32;
-        for seg in self.segs.iter_mut().rev() {
-            if seg.sacked {
-                sacked_after = sacked_after.saturating_add(1);
-                continue;
-            }
-            if seg.lost {
-                continue;
-            }
-            let rack_lost = newest_acked_tx
-                .map(|latest| {
-                    latest.duration_since(seg.sent_at) >= rack_thresh
-                        && highest_sacked.is_some_and(|h| seg.seq.lt(h))
-                })
-                .unwrap_or(false);
-            let hole_lost = sacked_after >= DUPACK_THRESH;
-            if hole_lost || rack_lost {
-                seg.lost = true;
-                newly_lost_bytes += u64::from(seg.len);
+            let mut sacked_after = 0u32;
+            for seg in self.segs.iter_mut().rev() {
+                if seg.sacked {
+                    sacked_after = sacked_after.saturating_add(1);
+                    continue;
+                }
+                if seg.lost {
+                    continue;
+                }
+                let rack_lost = newest_acked_tx
+                    .map(|latest| {
+                        latest.duration_since(seg.sent_at) >= rack_thresh
+                            && highest_sacked.is_some_and(|h| seg.seq.lt(h))
+                    })
+                    .unwrap_or(false);
+                let hole_lost = sacked_after >= DUPACK_THRESH;
+                if hole_lost || rack_lost {
+                    seg.lost = true;
+                    let seg_bytes = u64::from(seg.len);
+                    newly_lost_bytes += seg_bytes;
+                    self.lost_count += 1;
+                    self.in_flight_bytes -= seg_bytes;
+                }
             }
         }
         if duplicate_ack
@@ -764,11 +816,16 @@ impl TxQueue {
             && !front.lost
         {
             front.lost = true;
-            newly_lost_bytes += u64::from(front.len);
+            let seg_bytes = u64::from(front.len);
+            newly_lost_bytes += seg_bytes;
+            self.lost_count += 1;
+            self.in_flight_bytes -= seg_bytes;
         }
 
-        // Sort records by monotonic offset so RateSampler sees monotonic order.
-        self.ack_scratch.sort_by_key(|r| r.seq);
+        // Cumulative-only ACKs already append records in monotonic `rel_seq` order.
+        if applied_sack {
+            self.ack_scratch.sort_by_key(|r| r.seq);
+        }
         let sample = sampler.on_ack(
             now,
             &self.ack_scratch,

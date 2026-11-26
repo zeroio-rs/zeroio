@@ -1,5 +1,5 @@
 //! Multi-connection sans-I/O TCP stack coordinator owning [`ConnSlab`],
-//! listener ports, stateless SYN cookies, [`TimingWheel`] deadlines, and
+//! listener ports, stateless SYN cookies, indexed min-heap deadlines, and
 //! [`PathTable`] priors.
 
 use crate::TransportInstant;
@@ -9,11 +9,11 @@ use crate::packet::{
     encode_tcp_frame,
 };
 use crate::path_table::{DEFAULT_CAPACITY, DEFAULT_TTL, PathKey, PathTable};
-use crate::sched::{FlowId, TimingWheel};
 use crate::tcp::conn::{TcpConfig, TcpConn, TcpConnSnapshot, TcpFourTuple};
 use crate::tcp::cookie::{SynCookieKey, generate_syn_cookie, verify_syn_cookie};
 use crate::tcp::seq::SeqNum;
 use crate::tcp::{ConnHandle, ConnSlab, TcpState};
+use core::cmp::Ordering;
 use core::net::{IpAddr, SocketAddr};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -47,14 +47,143 @@ struct StatelessReply {
     ttl: u8,
 }
 
-fn handle_to_flow_id(h: ConnHandle) -> FlowId {
-    (u64::from(h.index) << 32) | u64::from(h.generation)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SchedEntry {
+    at: TransportInstant,
+    order: u64,
+    handle: ConnHandle,
 }
 
-fn flow_id_to_handle(id: FlowId) -> ConnHandle {
-    ConnHandle {
-        index: (id >> 32) as u32,
-        generation: id as u32,
+impl Ord for SchedEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.at
+            .cmp(&other.at)
+            .then_with(|| self.order.cmp(&other.order))
+    }
+}
+
+impl PartialOrd for SchedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Indexed min-heap storing at most one cancellable deadline per active `ConnSlab` slot.
+#[derive(Default)]
+struct ConnSchedule {
+    heap: Vec<SchedEntry>,
+    slots: Vec<Option<usize>>,
+    next_order: u64,
+}
+
+impl ConnSchedule {
+    fn swap_nodes(&mut self, a: usize, b: usize) {
+        self.heap.swap(a, b);
+        self.slots[self.heap[a].handle.index as usize] = Some(a);
+        self.slots[self.heap[b].handle.index as usize] = Some(b);
+    }
+
+    fn sift_up(&mut self, mut idx: usize) {
+        while idx > 0 {
+            let parent = (idx - 1) / 2;
+            if self.heap[idx] < self.heap[parent] {
+                self.swap_nodes(idx, parent);
+                idx = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn sift_down(&mut self, mut idx: usize) {
+        let len = self.heap.len();
+        loop {
+            let left = idx * 2 + 1;
+            if left >= len {
+                break;
+            }
+            let right = left + 1;
+            let best = if right < len && self.heap[right] < self.heap[left] {
+                right
+            } else {
+                left
+            };
+            if self.heap[best] < self.heap[idx] {
+                self.swap_nodes(idx, best);
+                idx = best;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn remove_at(&mut self, idx: usize) -> SchedEntry {
+        let last = self.heap.len() - 1;
+        if idx != last {
+            self.swap_nodes(idx, last);
+        }
+        let popped = self.heap.pop().unwrap();
+        self.slots[popped.handle.index as usize] = None;
+        if idx < self.heap.len() {
+            self.sift_up(idx);
+            self.sift_down(idx);
+        }
+        popped
+    }
+
+    fn set(&mut self, handle: ConnHandle, at: TransportInstant) {
+        let slot = handle.index as usize;
+        if slot >= self.slots.len() {
+            self.slots.resize(slot + 1, None);
+        }
+        if let Some(idx) = self.slots[slot]
+            && self.heap[idx].handle == handle
+            && self.heap[idx].at == at
+        {
+            return;
+        }
+        self.next_order = self.next_order.wrapping_add(1);
+        let entry = SchedEntry {
+            at,
+            order: self.next_order,
+            handle,
+        };
+        if let Some(idx) = self.slots[slot] {
+            let prev = core::mem::replace(&mut self.heap[idx], entry);
+            if entry < prev {
+                self.sift_up(idx);
+            } else {
+                self.sift_down(idx);
+            }
+        } else {
+            let idx = self.heap.len();
+            self.heap.push(entry);
+            self.slots[slot] = Some(idx);
+            self.sift_up(idx);
+        }
+    }
+
+    fn remove(&mut self, handle: ConnHandle) {
+        let slot = handle.index as usize;
+        let Some(&Some(idx)) = self.slots.get(slot) else {
+            return;
+        };
+        if self.heap[idx].handle != handle {
+            return;
+        }
+        let _ = self.remove_at(idx);
+    }
+
+    fn peek_deadline(&self) -> Option<TransportInstant> {
+        self.heap.first().map(|e| e.at)
+    }
+
+    fn pop_due(&mut self, now: TransportInstant) -> Option<ConnHandle> {
+        if self.heap.first().is_some_and(|e| e.at <= now) {
+            Some(self.remove_at(0).handle)
+        } else {
+            None
+        }
     }
 }
 
@@ -77,7 +206,8 @@ pub struct TcpStack {
     slab: ConnSlab<TcpConn>,
     by_flow: HashMap<TcpFourTuple, ConnHandle>,
     listeners: HashSet<u16>,
-    wheel: TimingWheel,
+    schedule: ConnSchedule,
+    due_scratch: Vec<ConnHandle>,
     path_table: PathTable,
     cookie_key: SynCookieKey,
     isn_counter: u32,
@@ -93,7 +223,8 @@ impl TcpStack {
             slab: ConnSlab::with_capacity(initial_cap),
             by_flow: HashMap::with_capacity(initial_cap),
             listeners: HashSet::new(),
-            wheel: TimingWheel::new(),
+            schedule: ConnSchedule::default(),
+            due_scratch: Vec::with_capacity(64),
             path_table: PathTable::new(DEFAULT_CAPACITY, DEFAULT_TTL),
             cookie_key,
             isn_counter: 0x1020_3040,
@@ -152,9 +283,12 @@ impl TcpStack {
 
     fn schedule_conn(&mut self, handle: ConnHandle) {
         if let Some(conn) = self.slab.get(handle)
+            && conn.state != TcpState::Closed
             && let Some(due) = conn.next_deadline()
         {
-            let _ = self.wheel.schedule(handle_to_flow_id(handle), due);
+            self.schedule.set(handle, due);
+        } else {
+            self.schedule.remove(handle);
         }
     }
 
@@ -166,6 +300,7 @@ impl TcpStack {
         if !should_reclaim {
             return;
         }
+        self.schedule.remove(handle);
         if let Some(conn) = self.slab.remove(handle) {
             self.by_flow.remove(&conn.flow);
             let key = path_key_for(conn.flow.local.ip(), conn.flow.peer.ip());
@@ -417,9 +552,12 @@ impl TcpStack {
 
     /// Advance all due connection timers (RTO, delayed ACK, TIME_WAIT cleanup).
     pub fn on_timer(&mut self, now: TransportInstant) {
-        self.wheel.advance_to(now);
-        let handles: Vec<ConnHandle> = self.by_flow.values().copied().collect();
-        for handle in handles {
+        self.due_scratch.clear();
+        while let Some(handle) = self.schedule.pop_due(now) {
+            self.due_scratch.push(handle);
+        }
+        for i in 0..self.due_scratch.len() {
+            let handle = self.due_scratch[i];
             if let Some(conn) = self.slab.get_mut(handle) {
                 conn.on_timer(now);
             }
@@ -433,18 +571,10 @@ impl TcpStack {
         if !self.stateless_replies.is_empty() {
             return Some(TransportInstant::ZERO);
         }
-        let mut min_due: Option<TransportInstant> = None;
-        for &handle in self.by_flow.values() {
-            if let Some(conn) = self.slab.get(handle)
-                && let Some(due) = conn.next_deadline()
-            {
-                min_due = Some(min_due.map_or(due, |m| m.min(due)));
-            }
-        }
-        min_due
+        self.schedule.peek_deadline()
     }
 
-    /// Poll all ready outbound frames (stateless replies + scheduled connection segments).
+    /// Poll all ready outbound frames (stateless replies + due connection segments).
     pub fn poll_tx(
         &mut self,
         now: TransportInstant,
@@ -484,24 +614,75 @@ impl TcpStack {
             self.stateless_replies.pop_front();
         }
 
-        // Drain due timing-wheel slots first, then ensure all active connections with
-        // immediate work are polled cleanly.
-        while let Some(fid) = self.wheel.pop_due(now, &mut |_id, _gen| true) {
-            let h = flow_id_to_handle(fid);
-            if let Some(conn) = self.slab.get_mut(h) {
-                conn.poll_tx(now, tx_buf, &mut emit);
-            }
+        self.due_scratch.clear();
+        while let Some(handle) = self.schedule.pop_due(now) {
+            self.due_scratch.push(handle);
         }
 
-        let handles: Vec<ConnHandle> = self.by_flow.values().copied().collect();
-        for handle in handles {
-            if let Some(conn) = self.slab.get_mut(handle)
-                && conn.next_deadline().is_some_and(|d| d <= now)
-            {
-                conn.poll_tx(now, tx_buf, &mut emit);
+        let mut stopped = false;
+        let len = self.due_scratch.len();
+        for i in 0..len {
+            let handle = self.due_scratch[i];
+            if !stopped && let Some(conn) = self.slab.get_mut(handle) {
+                conn.poll_tx(now, tx_buf, &mut |wire| {
+                    if emit(wire) {
+                        true
+                    } else {
+                        stopped = true;
+                        false
+                    }
+                });
             }
             self.reclaim_closed(handle, now);
             self.schedule_conn(handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conn_schedule_updates_in_place_and_ignores_stale_generation() {
+        let mut sched = ConnSchedule::default();
+        let old = ConnHandle {
+            index: 3,
+            generation: 1,
+        };
+        let fresh = ConnHandle {
+            index: 3,
+            generation: 2,
+        };
+        let other = ConnHandle {
+            index: 7,
+            generation: 1,
+        };
+
+        sched.set(other, TransportInstant::from_micros(500));
+        sched.set(old, TransportInstant::from_micros(900));
+        sched.remove(old);
+        sched.set(fresh, TransportInstant::from_micros(200));
+        // Updating the same slot must not grow heap.
+        for t in 100..200 {
+            sched.set(fresh, TransportInstant::from_micros(t));
+        }
+        assert_eq!(sched.heap.len(), 2);
+        // Stale handle cannot cancel `fresh`.
+        sched.remove(old);
+        assert_eq!(
+            sched.peek_deadline(),
+            Some(TransportInstant::from_micros(199))
+        );
+        assert_eq!(
+            sched.pop_due(TransportInstant::from_micros(199)),
+            Some(fresh)
+        );
+        assert_eq!(sched.pop_due(TransportInstant::from_micros(499)), None);
+        assert_eq!(
+            sched.pop_due(TransportInstant::from_micros(500)),
+            Some(other)
+        );
+        assert_eq!(sched.peek_deadline(), None);
     }
 }

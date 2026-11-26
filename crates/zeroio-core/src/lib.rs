@@ -32,6 +32,7 @@ pub mod instant;
 pub mod model;
 pub mod packet;
 pub mod path_table;
+pub mod prefix;
 pub mod rate_sample;
 pub mod rtt;
 pub mod sched;
@@ -55,6 +56,7 @@ pub use packet::{
     l4_pseudo_checksum,
 };
 pub use path_table::{PathKey, PathSample, PathTable};
+pub use prefix::PrefixIndex;
 pub use rate_sample::{RateSample, RateSampler, TxRecord};
 pub use rtt::RttState;
 pub use sched::{Admit, Lease, Scheduler, TimingWheel};
