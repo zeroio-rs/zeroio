@@ -1,5 +1,24 @@
-//! Thread-per-core dataplane abstractions and XDP/kernel transport policy.
+//! Thread-per-core dataplane runtime, UMEM management, neighbor/ARP state,
+//! XSK device abstractions, and Linux AF_XDP + eBPF control.
 
+pub mod clock;
+pub mod device;
+#[cfg(target_os = "linux")]
+pub mod linux;
+pub mod neighbor;
+pub mod reactor;
+pub mod runtime;
+pub mod umem;
+
+pub use clock::TransportClock;
+pub use device::{LoopbackXskDevice, TxSubmitError, XskDevice};
+pub use neighbor::{
+    ArpIpv4Packet, ETHERTYPE_ARP, NeighborEntry, NeighborTable, encode_arp_reply_ipv4,
+    parse_arp_ipv4,
+};
+pub use reactor::{PollOutcome, QueueConfig, QueueReactor, QueueStats};
+pub use runtime::{ConfigError, DataplaneHandle, DataplaneManager, WorkerPlan};
+pub use umem::{DEFAULT_FRAME_HEADROOM, UmemConfig, UmemFrameToken, UmemSlab};
 pub use zeroio_core::{PacketView, TransportInstant};
 pub use zeroio_xdp_common::{XDP_DEFAULT_FRAME_SIZE, XdpCounters, XdpInterfaceMode};
 
@@ -15,7 +34,7 @@ pub enum XdpAttachMode {
     Generic,
 }
 
-/// Effective AF_XDP socket bind mode reported by the kernel.
+/// Effective AF_XDP socket bind mode reported by the kernel or test device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XskBindMode {
     /// Hardware DMA zero-copy (`XDP_ZEROCOPY`).
@@ -39,27 +58,18 @@ pub struct InterfaceConfig {
 }
 
 impl InterfaceConfig {
-    /// Construct a default `Protect`-mode interface configuration with standard
-    /// 2048-byte UMEM frames.
+    /// Create a default interface policy in [`XdpInterfaceMode::Protect`].
     pub fn protect(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             mode: XdpInterfaceMode::Protect,
             attach_mode: XdpAttachMode::Auto,
             frame_size: XDP_DEFAULT_FRAME_SIZE,
-            queues: Vec::new(),
-            cpus: Vec::new(),
+            queues: vec![0],
+            cpus: vec![0],
             prefer_zerocopy: true,
         }
     }
-}
-
-/// Ownership token for one UMEM frame slot inside a per-queue dataplane loop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct UmemFrameToken {
-    pub queue: u32,
-    pub addr: u64,
-    pub len: u32,
 }
 
 #[cfg(test)]
@@ -69,9 +79,9 @@ mod tests {
     #[test]
     fn default_interface_uses_protect_and_standard_frame_size() {
         let cfg = InterfaceConfig::protect("eth0");
-        assert_eq!(cfg.name, "eth0");
         assert_eq!(cfg.mode, XdpInterfaceMode::Protect);
-        assert_eq!(cfg.frame_size, XDP_DEFAULT_FRAME_SIZE);
+        assert_eq!(cfg.frame_size, 2048);
         assert!(cfg.prefer_zerocopy);
+        assert!(cfg.validate().is_ok());
     }
 }

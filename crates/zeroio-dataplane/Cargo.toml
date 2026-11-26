@@ -13,6 +13,10 @@ description = "Thread-per-core dataplane runtime abstractions, AF_XDP zero-copy 
 zeroio-core = { version = "0.1.0", path = "../zeroio-core" }
 zeroio-xdp-common = { version = "0.1.0", path = "../zeroio-xdp-common" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.14"
+libc = "0.2"
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
